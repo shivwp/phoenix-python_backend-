@@ -1,0 +1,17 @@
+# Web Framework & Server
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+python-dotenv
+httpx
+
+# LangChain & AI
+langchain
+langchain-core
+langchain-google-genai
+langgraph
+
+# Utilities
+python-multipart
+typing-extensions

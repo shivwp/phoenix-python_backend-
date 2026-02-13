@@ -1,65 +1,40 @@
 import json
-import os
 import re
-import sys
 import uuid
 from contextlib import asynccontextmanager
-from enum import Enum
-from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi import FastAPI, HTTPException, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_google_genai import ChatGoogleGenerativeAI
-
-# LangGraph & LangChain Imports
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, START, StateGraph
+from langgraph.graph import START, StateGraph
 from langgraph.prebuilt import tools_condition
 from pydantic import BaseModel, Field
 
+# Custom Imports
 from agents import Assistant, State, validate_session_and_get_config
 from config import settings
-
-# Custom Imports (Phoenix App)
-from prompts import (
-    ADMIN_DASHBOARD_PROMPT,  # Admin ke liye analytics/control prompt
-    USER_LIFESTYLE_PROMPT,  # User ke liye guidance prompt
-)
+from prompts import USER_LIFESTYLE_PROMPT
 from tools import (
-    # Ye list use karna aasaan rahega
-    check_period_cycle,
     create_tool_node_with_fallback,
-    get_nutrition_logs,
-    get_wellness_context,
-    post_lifestyle_nudge,
+    get_user_home_context,  # Updated Tool
+    post_lifestyle_nudge,  # Updated Tool
 )
-
-
-# ------------------------------------------------------------------
-# Roles & Enums
-# ------------------------------------------------------------------
-class UserRole(str, Enum):
-    USER = "user"
-    ADMIN = "admin"
 
 
 # ------------------------------------------------------------------
 # Request/Response Models
 # ------------------------------------------------------------------
-
-
 class ChatRequest(BaseModel):
-    role: UserRole
     message: str
-    token: str  # Isse hi hum access_token ki tarah use karenge
+    token: str
     session_id: Optional[str] = None
-    user_logs: Dict[str, Any] = Field(
-        default_factory=dict
-    )  # Mandatory for Smart Hashing
+    user_logs: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
 
 class ChatResponseItem(BaseModel):
@@ -74,10 +49,9 @@ class ChatResponse(BaseModel):
 
 
 # ------------------------------------------------------------------
-# Helper Function: Process Data Into Items
+# Helper: Process JSON into ChatResponseItems
 # ------------------------------------------------------------------
 def process_data_into_items(data: Any) -> List[ChatResponseItem]:
-    """AI ke response (JSON) ko frontend ke standard format mein convert karta hai."""
     items = []
     if isinstance(data, list):
         for item in data:
@@ -89,7 +63,9 @@ def process_data_into_items(data: Any) -> List[ChatResponseItem]:
                         "phase": item.get("phase"),
                         "focus_habit": item.get("focus_habit"),
                         "action": item.get("action"),
-                    },
+                    }
+                    if "phase" in item or "focus_habit" in item
+                    else item.get("data"),
                 )
             )
     elif isinstance(data, dict):
@@ -104,19 +80,13 @@ def process_data_into_items(data: Any) -> List[ChatResponseItem]:
 
 
 # ------------------------------------------------------------------
-# Agent Factory (Logic for User & Admin)
+# Phoenix Agent Factory (User Only)
 # ------------------------------------------------------------------
-def get_phoenix_agent(role: UserRole, tools: List):
-    # Prompt logic
-    system_prompt = (
-        USER_LIFESTYLE_PROMPT if role == UserRole.USER else ADMIN_DASHBOARD_PROMPT
-    )
-
+def get_phoenix_agent(tools: List):
     prompt_template = ChatPromptTemplate.from_messages(
         [
-            ("system", system_prompt),
-            # Context inject karne ke liye ek extra system message
-            ("system", "Here is the user's current data: {lifestyle_context}"),
+            ("system", USER_LIFESTYLE_PROMPT),
+            ("system", "Current User Data Context: {lifestyle_context}"),
             MessagesPlaceholder(variable_name="messages"),
         ]
     )
@@ -124,9 +94,7 @@ def get_phoenix_agent(role: UserRole, tools: List):
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash",
         google_api_key=settings.GEMINI_API_KEY,
-        temperature=0.1
-        if role == UserRole.ADMIN
-        else 0.4,  # Admin strict, User conversational
+        temperature=0.4,
     )
 
     runnable_chain = prompt_template | llm.bind_tools(tools)
@@ -139,97 +107,50 @@ def get_phoenix_agent(role: UserRole, tools: List):
     builder.add_conditional_edges("assistant", tools_condition)
     builder.add_edge("tools", "assistant")
 
-    memory = MemorySaver()
-    return builder.compile(checkpointer=memory)
+    return builder.compile(checkpointer=MemorySaver())
 
 
 # ------------------------------------------------------------------
-# Chat Logic
-# ------------------------------------------------------------------
-async def run_chatbot(runnable_graph, user_message, token, thread_id):
-    config = {"configurable": {"thread_id": thread_id or str(uuid.uuid4())}}
-
-    # Context injection
-    input_state = {"messages": [("user", user_message)]}
-
-    result = await runnable_graph.ainvoke(input_state, config)
-
-    # --- SAFETY CHECK FOR CONTENT ---
-    last_message = result["messages"][-1]
-    content = last_message.content
-
-    # Agar content list hai (Gemini blocks), toh pehla block uthao ya join karo
-    if isinstance(content, list):
-        # Aksar Gemini list mein bhejta hai [ {'type': 'text', 'text': '...'} ]
-        content = " ".join(
-            [
-                block.get("text", "") if isinstance(block, dict) else str(block)
-                for block in content
-            ]
-        )
-
-    # Ab Robust JSON Cleanup chalega
-    if isinstance(content, str) and content.strip():
-        # Remove markdown tags
-        cleaned = re.sub(r"^```json\s*|\s*```$", "", content.strip()).strip()
-        try:
-            data = json.loads(cleaned)
-            return data if isinstance(data, list) else [data]
-        except json.JSONDecodeError:
-            # Agar JSON nahi hai toh simple text format mein bhej do
-            return [{"message": cleaned, "type": "text"}]
-
-    # Agar content empty ya non-string hai
-    return [{"message": str(content), "type": "text"}]
-
-
-# ------------------------------------------------------------------
-# FastAPI App
+# FastAPI App Setup
 # ------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Setup Tools
-    user_tools = [get_wellness_context, get_nutrition_logs, check_period_cycle]
-    admin_tools = [post_lifestyle_nudge]  # Ya jo bhi admin tools hain
-
-    # Initialize separate agents
-    app.state.user_agent = get_phoenix_agent(UserRole.USER, user_tools)
-    app.state.admin_agent = get_phoenix_agent(UserRole.ADMIN, admin_tools)
+    # Only User Tools - Updated to use the Master API Tool
+    user_tools = [get_user_home_context, post_lifestyle_nudge]
+    app.state.agent = get_phoenix_agent(user_tools)
     yield
 
 
-app = FastAPI(title="PHOENIX AI", lifespan=lifespan)
+app = FastAPI(title="PHOENIX AI - User Coach", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
-
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=True)
 
 
 @app.post("/v1/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest, api_key: str = Security(api_key_header)):
     try:
-        # 1. & 2. AUTH & ROLE (Theek hai)
+        # Auth Check
         if api_key != settings.X_API_KEY:
-            raise HTTPException(status_code=403, detail="Unauthorized access")
+            raise HTTPException(status_code=403, detail="Invalid API Key")
 
-        agent = (
-            app.state.user_agent
-            if request.role == UserRole.USER
-            else app.state.admin_agent
-        )
-
-        # 3. SMART REDIS VALIDATION
+        # Session & Smart Hashing
         validated_thread_id = await validate_session_and_get_config(
             thread_id=request.session_id or str(uuid.uuid4()),
             current_lifestyle_data=request.user_logs,
         )
-
-        # 4. PREPARE INPUT (Key Check: Kya State class mein 'lifestyle_context' hai?)
+        now = datetime.now()
+        current_context = f"Today is {now.strftime('%A')}, {now.strftime('%d %B %Y')}. Time: {now.strftime('%H:%M')}"
+        # current_day = datetime.now().strftime("%A")
+        # Prepare Graph Input
         input_state = {
             "messages": [("user", request.message)],
-            "lifestyle_context": request.user_logs,
+            "lifestyle_context": {
+                    **request.user_logs, 
+                    "current_time_info": current_context # AI ko pata chal gaya aaj Friday hai
+                }
         }
 
         config = {
@@ -239,58 +160,45 @@ async def chat_endpoint(request: ChatRequest, api_key: str = Security(api_key_he
             }
         }
 
-        # 5. RUN AGENT
-        result = await agent.ainvoke(input_state, config=config)
+        # Invoke Agent
+        result = await app.state.agent.ainvoke(input_state, config=config)
 
-        # 6. RESPONSE PROCESSING (Robust Handling)
+        # Parse Response
         last_msg = result.get("messages", [])[-1] if result.get("messages") else None
-
-        if not last_msg:
+        if not last_msg or not last_msg.content:
             return ChatResponse(
-                response=[ChatResponseItem(message="No response", type="error")],
+                response=[
+                    ChatResponseItem(message="No response from coach", type="error")
+                ],
                 session_id=validated_thread_id,
             )
 
-        # --- YAHAN FIX HAI ---
-        response_content = last_msg.content
-
-        # Agar content list hai (Gemini Multi-part), toh string banao
-        if isinstance(response_content, list):
-            response_content = " ".join(
+        content = last_msg.content
+        # Handle Gemini List Content
+        if isinstance(content, list):
+            content = " ".join(
                 [
                     str(b.get("text", b)) if isinstance(b, dict) else str(b)
-                    for b in response_content
+                    for b in content
                 ]
             )
 
-        if not response_content:
-            return ChatResponse(
-                response=[ChatResponseItem(message="Empty response", type="error")],
-                session_id=validated_thread_id,
-            )
-
-        # Ab .strip() safely chalega
-        cleaned_content = re.sub(
-            r"^```json\s*|\s*```$", "", response_content.strip()
-        ).strip()
-
+        # Cleanup & JSON Load
+        cleaned = re.sub(r"^```json\s*|\s*```$", "", content.strip()).strip()
         try:
-            data = json.loads(cleaned_content)
-            # Ensure data is processed into list of ChatResponseItem
-            response_items = process_data_into_items(data)
-            return ChatResponse(response=response_items, session_id=validated_thread_id)
-
+            data = json.loads(cleaned)
+            return ChatResponse(
+                response=process_data_into_items(data), session_id=validated_thread_id
+            )
         except json.JSONDecodeError:
             return ChatResponse(
-                response=[ChatResponseItem(message=response_content, type="text")],
+                response=[ChatResponseItem(message=content, type="text")],
                 session_id=validated_thread_id,
             )
 
-    except HTTPException as e:
-        raise e
     except Exception as e:
-        print(f"🔥 CRITICAL ERROR: {str(e)}")  # Terminal mein error dekho
-        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+        print(f"🔥 ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 if __name__ == "__main__":
